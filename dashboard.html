@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>LoRa • Dashboard MQTT (Auto WS/WSS) • PIPV_LATP</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- MQTT.js -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;margin:20px;background:#0f172a;color:#e5e7eb}
+    h1{font-size:20px;margin-bottom:10px}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    input{padding:6px 8px;border-radius:6px;border:1px solid #374151;background:#111827;color:#e5e7eb}
+    label{font-size:12px;color:#9ca3af}
+    button{margin:4px;padding:8px 12px;border-radius:6px;border:none;cursor:pointer}
+    #btnConnect{background:#2563eb;color:#fff} #btnDisconnect{background:#ef4444;color:#fff}
+    #btnClear{background:#f59e0b;color:#fff} #btnCSV{background:#10b981;color:#fff}
+    table{border-collapse:collapse;width:100%;margin-top:12px}
+    th,td{border:1px solid #374151;padding:8px;text-align:center}
+    th{background:#1f2937} tr:nth-child(even){background:#111827}
+    .badge{padding:6px 10px;border-radius:999px;border:1px solid #374151;background:#111827;color:#9ca3af}
+    #log{white-space:pre-wrap;background:#111827;border:1px solid #374151;border-radius:8px;padding:10px;max-height:220px;overflow:auto}
+  </style>
+</head>
+<body>
+  <h1>Dashboard LoRa → MQTT (MQTT.js) • PIPV_LATP</h1>
+
+  <div class="row" style="margin-bottom:8px">
+    <div><label>Topic</label><br/><input id="topic" value="lora/gateway/up" style="width:240px"></div>
+    <div><label>Client ID</label><br/><input id="clientId" value="webclient_PIPV_LATP"></div>
+  </div>
+
+  <div class="row" style="margin-bottom:8px">
+    <button id="btnConnect">Conectar (auto WSS→WS)</button>
+    <button id="btnDisconnect">Desconectar</button>
+    <button id="btnClear">Limpiar tabla</button>
+    <button id="btnCSV">Exportar CSV</button>
+    <span id="state" class="badge">Estado: —</span>
+    <span id="count" class="badge">Registros: 0</span>
+  </div>
+
+  <div id="log" aria-label="Log de conexión"></div>
+
+  <table id="tbl">
+    <thead>
+      <tr>
+        <th>#</th><th>Timestamp</th><th>Equipo</th><th>Contador</th><th>RSSI</th><th>Payload</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+<script>
+  let client = null;
+  let records = [];
+  const tblBody = document.querySelector('#tbl tbody');
+  const stateEl = document.getElementById('state');
+  const countEl = document.getElementById('count');
+  const logEl = document.getElementById('log');
+
+  const urls = [
+    "wss://test.mosquitto.org:8081/mqtt", // primero seguro (evita bloqueo por contenido mixto)
+    "ws://test.mosquitto.org:8080/mqtt"   // fallback sin TLS
+  ];
+
+  function log(msg){ logEl.textContent += msg + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+  function setState(t){ stateEl.textContent = "Estado: " + t; }
+
+  function connect(){
+    const topic = document.getElementById('topic').value.trim();
+    const cid = (document.getElementById('clientId').value.trim() || ("web_"+Math.random().toString(16).slice(2)));
+
+    let idx = 0;
+    const tryNext = () => {
+      if (idx >= urls.length){ setState("falló conexión"); return; }
+      const url = urls[idx++];
+      setState("conectando… " + url);
+      log("Intentando: " + url);
+
+      client = mqtt.connect(url, {
+        clientId: cid,
+        keepalive: 60,
+        reconnectPeriod: 0, // sin auto-reintento aquí; lo hacemos manual al fallar
+        clean: true,
+      });
+
+      let connectedOnce = false;
+
+      client.on('connect', () => {
+        connectedOnce = true;
+        setState("conectado: " + url);
+        log("Conectado a " + url);
+        client.subscribe(topic, { qos: 0 }, (err) => {
+          if (err){ setState("error al suscribir"); log("Suscripción error: " + err.message); }
+          else { setState("suscrito a " + topic); log("Suscrito a " + topic); }
+        });
+      });
+
+      client.on('message', (t, payload) => {
+        try{
+          const text = new TextDecoder().decode(payload);
+          const obj = JSON.parse(text);
+          if (!obj || obj.Equipo===undefined || obj.Contador===undefined || obj.RSSI===undefined) return;
+          const now = new Date().toISOString();
+          records.push({ ts: now, ...obj });
+          countEl.textContent = "Registros: " + records.length;
+
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${records.length}</td>
+            <td>${now}</td>
+            <td>${obj.Equipo}</td>
+            <td>${obj.Contador}</td>
+            <td>${obj.RSSI}</td>
+            <td><code>${text.replace(/</g,'&lt;')}</code></td>`;
+          tblBody.prepend(tr);
+        }catch(e){ log("Mensaje no JSON: " + e.message); }
+      });
+
+      client.on('error', (err) => { log("ERROR: " + (err && err.message ? err.message : err)); });
+      client.on('close', () => {
+        log("CLOSE (url actual)");
+        if (!connectedOnce){ // si nunca conectó, probamos el siguiente URL
+          tryNext();
+        } else {
+          setState("desconectado");  // si ya hubo sesión, no hacemos failover automático
+        }
+      });
+      client.on('end', () => log("END"));
+    };
+
+    tryNext();
+  }
+
+  function disconnect(){ if (client) { client.end(true); setState("desconectado"); log("Desconectado manualmente"); } }
+  function clearTable(){ records=[]; tblBody.innerHTML=''; countEl.textContent="Registros: 0"; }
+  function exportCSV(){
+    if(!records.length){ alert("No hay datos"); return; }
+    const header = "timestamp,Equipo,Contador,RSSI";
+    const lines = records.map(r => `${r.ts},${r.Equipo},${r.Contador},${r.RSSI}`);
+    const blob = new Blob([ [header, ...lines].join("\n") ], { type:"text/csv" });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = 'lora_registros.csv'; a.click(); URL.revokeObjectURL(url);
+  }
+
+  document.getElementById('btnConnect').onclick = connect;
+  document.getElementById('btnDisconnect').onclick = disconnect;
+  document.getElementById('btnClear').onclick = clearTable;
+  document.getElementById('btnCSV').onclick = exportCSV;
+</script>
+</body>
+</html>
